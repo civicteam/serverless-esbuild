@@ -9,7 +9,9 @@ import { uniq } from 'ramda';
 
 import type Serverless from 'serverless';
 import type ServerlessPlugin from 'serverless/classes/Plugin';
-import type { Configuration, DependencyMap, FunctionEntry } from './types';
+import type { Configuration, DependencyMap, FunctionEntry, IFile } from './types';
+import type { EsbuildFunctionDefinitionHandler } from './types';
+import { DEFAULT_EXTENSIONS } from './constants';
 
 export function asArray<T>(data: T | T[]): T[] {
   return Array.isArray(data) ? data : [data];
@@ -26,7 +28,8 @@ export function assertIsString(input: unknown, message = 'input is not a string'
 export function extractFunctionEntries(
   cwd: string,
   provider: string,
-  functions: Record<string, Serverless.FunctionDefinitionHandler>
+  functions: Record<string, Serverless.FunctionDefinitionHandler>,
+  resolveExtensions?: string[]
 ): FunctionEntry[] {
   // The Google provider will use the entrypoint not from the definition of the
   // handler function, but instead from the package.json:main field, or via a
@@ -54,46 +57,48 @@ export function extractFunctionEntries(
     }
   }
 
-  return Object.keys(functions).map((functionAlias) => {
-    const func = functions[functionAlias];
+  return Object.keys(functions)
+    .filter((functionAlias) => {
+      return !(functions[functionAlias] as EsbuildFunctionDefinitionHandler).skipEsbuild;
+    })
+    .map((functionAlias) => {
+      const func = functions[functionAlias];
+      assert(func, `${functionAlias} not found in functions`);
 
-    assert(func, `${functionAlias} not found in functions`);
+      const { handler } = func;
+      const fnName = path.extname(handler);
+      const fnNameLastAppearanceIndex = handler.lastIndexOf(fnName);
+      // replace only last instance to allow the same name for file and handler
+      const fileName = handler.substring(0, fnNameLastAppearanceIndex);
 
-    const { handler } = func;
-    const fnName = path.extname(handler);
-    const fnNameLastAppearanceIndex = handler.lastIndexOf(fnName);
-    // replace only last instance to allow the same name for file and handler
-    const fileName = handler.substring(0, fnNameLastAppearanceIndex);
+      const extensions = resolveExtensions ?? DEFAULT_EXTENSIONS;
 
-    const extensions = ['.ts', '.js', '.jsx', '.tsx'];
+      for (const extension of extensions) {
+        // Check if the .{extension} files exists. If so return that to watch
+        if (fs.existsSync(path.join(cwd, fileName + extension))) {
+          const entry = path.relative(cwd, fileName + extension);
 
-    for (const extension of extensions) {
-      // Check if the .{extension} files exists. If so return that to watch
-      if (fs.existsSync(path.join(cwd, fileName + extension))) {
-        const entry = path.relative(cwd, fileName + extension);
+          return {
+            func,
+            functionAlias,
+            entry: os.platform() === 'win32' ? entry.replace(/\\/g, '/') : entry,
+          };
+        }
+        if (fs.existsSync(path.join(cwd, path.join(fileName, 'index') + extension))) {
+          const entry = path.relative(cwd, path.join(fileName, 'index') + extension);
 
-        return {
-          func,
-          functionAlias,
-          entry: os.platform() === 'win32' ? entry.replace(/\\/g, '/') : entry,
-        };
+          return {
+            func,
+            functionAlias,
+            entry: os.platform() === 'win32' ? entry.replace(/\\/g, '/') : entry,
+          };
+        }
       }
-      if (fs.existsSync(path.join(cwd, path.join(fileName, 'index') + extension))) {
-        const entry = path.relative(cwd, path.join(fileName, 'index') + extension);
-
-        return {
-          func,
-          functionAlias,
-          entry: os.platform() === 'win32' ? entry.replace(/\\/g, '/') : entry,
-        };
-      }
-    }
-
-    // Can't find the files. Watch will have an exception anyway. So throw one with error.
-    throw new Error(
-      `Compilation failed for function alias ${functionAlias}. Please ensure you have an index file with ext .ts or .js, or have a path listed as main key in package.json`
-    );
-  });
+      // Can't find the files. Watch will have an exception anyway. So throw one with error.
+      throw new Error(
+        `Compilation failed for function alias ${functionAlias}. Please ensure you have an index file with ext .ts or .js, or have a path listed as main key in package.json`
+      );
+    });
 }
 
 /**
@@ -225,11 +230,11 @@ export type ScalewayNodeProviderRuntimeMatcher<Versions extends number> = {
   [Version in Versions as `node${Version}`]: `node${Version}`;
 };
 
-export type AwsNodeMatcher = AwsNodeProviderRuntimeMatcher<12 | 14 | 16 | 18>;
+export type AwsNodeMatcher = AwsNodeProviderRuntimeMatcher<12 | 14 | 16 | 18 | 20>;
 
 export type AzureNodeMatcher = AzureNodeProviderRuntimeMatcher<12 | 14 | 16 | 18>;
 
-export type GoogleNodeMatcher = GoogleNodeProviderRuntimeMatcher<12 | 14 | 16 | 18>;
+export type GoogleNodeMatcher = GoogleNodeProviderRuntimeMatcher<12 | 14 | 16 | 18 | 20>;
 
 export type ScalewayNodeMatcher = ScalewayNodeProviderRuntimeMatcher<12 | 14 | 16 | 18 | 20>;
 
@@ -246,6 +251,7 @@ export type ScalewayNodeMatcherKey = keyof ScalewayNodeMatcher;
 export type NodeMatcherKey = AwsNodeMatcherKey | AzureNodeMatcherKey | GoogleNodeMatcherKey | ScalewayNodeMatcherKey;
 
 const awsNodeMatcher: AwsNodeMatcher = {
+  'nodejs20.x': 'node20',
   'nodejs18.x': 'node18',
   'nodejs16.x': 'node16',
   'nodejs14.x': 'node14',
@@ -260,6 +266,7 @@ const azureNodeMatcher: AzureNodeMatcher = {
 };
 
 const googleNodeMatcher: GoogleNodeMatcher = {
+  nodejs20: 'node20',
   nodejs18: 'node18',
   nodejs16: 'node16',
   nodejs14: 'node14',
@@ -309,3 +316,18 @@ export const buildServerlessV3LoggerFromLegacyLogger = (
   verbose: legacyLogger.log.bind(legacyLogger),
   success: legacyLogger.log.bind(legacyLogger),
 });
+
+export const stripEntryResolveExtensions = (file: IFile, extensions: string[]): IFile => {
+  const resolveExtensionMatch = file.localPath.match(extensions.map((ext) => ext).join('|'));
+
+  if (resolveExtensionMatch?.length && !DEFAULT_EXTENSIONS.includes(resolveExtensionMatch[0])) {
+    const extensionParts = resolveExtensionMatch[0].split('.');
+
+    return {
+      ...file,
+      localPath: file.localPath.replace(resolveExtensionMatch[0], `.${extensionParts[extensionParts.length - 1]}`),
+    };
+  }
+
+  return file;
+};
